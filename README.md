@@ -1,4 +1,4 @@
-# Airline fleet-assignment optimisation
+# Airline Tail Assignment Optimisation
 
 > **Sanitised technical case study.** This repository presents the architecture, modelling approach and validation principles behind a production airline decision-support system I developed. All examples are synthetic or approved for public use; proprietary data, commercial logic and production implementation details are excluded.
 
