@@ -1,0 +1,23 @@
+categorical_features:
+- perf_type
+- flt_no_cat
+- route
+feature_cols:
+- route_awy_dist_km
+- sched_block_hours
+- perf_type
+- flt_no_cat
+- route
+- mtow
+- month
+- day_of_week
+note: Feature set must match exactly at serve time. Optional features that are absent
+  here must also be absent at serve time, or models must be re-trained after adding
+  them.
+optional_absent:
+- dep_hour
+- seat_config
+optional_present: []
+targets:
+- target_baseline_fuel_kg
+- target_airborne_hours

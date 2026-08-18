@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+.venv/
+
+# Operational artefacts are intentionally absent from the public portfolio.
+/data/
+/post_flights_data/
+/documentations/
+/model/*.joblib
+/model/*.pkl
+/model/*.bin
+/output/
+/research/rotation-level-assignment/data/
+/research/rotation-level-assignment/results/
