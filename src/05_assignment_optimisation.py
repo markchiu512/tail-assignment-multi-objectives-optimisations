@@ -12,8 +12,9 @@ Responsibilities
     Cape Verde: only IRIS tails
     Cyprus:     CYPRUS_PROHIBITED tails excluded
     KEF:        only AUTOLAND-capable tails (or NEO types)
-- Optional ε-constraint sweep: minimise fuel s.t. total cost ≤ c*(1+ε)
-- Auto-select ε* via Kneedle / chord / curvature method if AUTO_SELECT_EPS = True
+- Optional global ε-constraint sweep: minimise daily fuel s.t. daily cost ≤ C*(1+ε)
+- Lexicographic tie-breaks: minimum fuel, then cost, then reassignment count
+- Auto-select an actual solved point from the validated cost/fuel concave hull
 - Write skipped-group JSON and (optional) ε-sweep CSVs
 
 Input  : {INTERMEDIATE_DIRECTORY}/{DATE_PREFIX}_eligibility_filter.csv
@@ -43,6 +44,7 @@ from pyomo.environ import (
     Binary,
     ConcreteModel,
     Constraint,
+    ConstraintList,
     Objective,
     Set,
     SolverFactory,
@@ -56,6 +58,8 @@ from pyomo.environ import (
 from config import (
     AUTO_SELECT_EPS,
     AUTO_SELECT_EPS_METHOD,
+    EPS_MAX_COST_PER_FUEL_KG,
+    EPS_KNEE_MIN_PROMINENCE,
     AUTOLAND_AIRCRAFTREG,
     CAPE_VERDE_IATA,
     CYPRUS_IATA,
@@ -72,133 +76,13 @@ from config import (
     SOLVER_BACKEND,
 )
 
+from src.eps_frontier import annotate_summary, select_frontier_point
+
 INPUT_FILE  = f"{DATE_PREFIX}_eligibility_filter.csv"
 OUTPUT_FILE = f"{DATE_PREFIX}_assignment_optimisation.csv"
 
 
-# ── ε-selection helpers (identical to v1.x) ──────────────────────────────────
-
-def _kneedle_select_eps(sweep_summary: dict) -> tuple[float, float] | tuple[None, None]:
-    from scipy.interpolate import PchipInterpolator
-
-    eps_keys = sorted(sweep_summary.keys(), key=float)
-    if len(eps_keys) < 2:
-        return None, None
-
-    xs, ys = [], []
-    for k in eps_keys:
-        s = sweep_summary[k]
-        baseline_usd = s.get("baseline_fuel_usd", 0.0)
-        fuel_usd = s.get("total_fuel_cost_usd", 0.0)
-        xs.append(float(k))
-        ys.append(baseline_usd - fuel_usd)
-
-    xs_arr = np.array(xs)
-    ys_arr = np.array(ys)
-
-    interp = PchipInterpolator(xs_arr, ys_arr)
-    x_fine = np.linspace(xs_arr[0], xs_arr[-1], 10_000)
-    y_fine = interp(x_fine)
-
-    x_min, x_max = float(x_fine[0]), float(x_fine[-1])
-    y_min, y_max = float(y_fine.min()), float(y_fine.max())
-
-    if x_max == x_min or y_max == y_min:
-        return xs[0], xs[0]
-
-    xs_n = (x_fine - x_min) / (x_max - x_min)
-    ys_n = (y_fine - y_min) / (y_max - y_min)
-
-    best_idx = int(np.argmax(ys_n - xs_n))
-    eps_star = round(float(x_fine[best_idx]), 6)
-    eps_applied = min(xs, key=lambda e: abs(e - eps_star))
-    return eps_star, eps_applied
-
-
-def _chord_select_eps(sweep_summary: dict) -> tuple[float, float] | tuple[None, None]:
-    from scipy.interpolate import PchipInterpolator
-
-    eps_keys = sorted(sweep_summary.keys(), key=float)
-    if len(eps_keys) < 2:
-        return None, None
-
-    xs, ys = [], []
-    for k in eps_keys:
-        s = sweep_summary[k]
-        baseline_usd = s.get("baseline_fuel_usd", 0.0)
-        fuel_usd = s.get("total_fuel_cost_usd", 0.0)
-        xs.append(float(k))
-        ys.append(baseline_usd - fuel_usd)
-
-    xs_arr = np.array(xs)
-    ys_arr = np.array(ys)
-
-    interp = PchipInterpolator(xs_arr, ys_arr)
-    x_fine = np.linspace(xs_arr[0], xs_arr[-1], 10_000)
-    y_fine = interp(x_fine)
-
-    x0, y0 = x_fine[0], y_fine[0]
-    x1, y1 = x_fine[-1], y_fine[-1]
-    dx, dy = x1 - x0, y1 - y0
-    line_len = np.hypot(dx, dy)
-    if line_len < 1e-12:
-        return xs[0], xs[0]
-
-    # Signed perpendicular offset from the endpoint chord; > 0 means the curve
-    # lies ABOVE the chord. Taking np.abs() here would let argmax land on a
-    # point BELOW the chord — a convex "anti-elbow" — which fabricates an elbow
-    # on curves that have none (e.g. an accelerating saving curve, where the
-    # correct answer is ε* = 0). The signed form restricts the search to the
-    # genuine above-chord elbow and makes this method algebraically identical
-    # to Kneedle on monotone-increasing curves.
-    dist = (dx * (y_fine - y0) - dy * (x_fine - x0)) / line_len
-    best_idx = int(np.argmax(dist))
-    eps_star = round(float(x_fine[best_idx]), 6)
-    eps_applied = min(xs, key=lambda e: abs(e - eps_star))
-    return eps_star, eps_applied
-
-
-def _curvature_select_eps(sweep_summary: dict) -> tuple[float, float] | tuple[None, None]:
-    from scipy.interpolate import PchipInterpolator
-
-    eps_keys = sorted(sweep_summary.keys(), key=float)
-    if len(eps_keys) < 2:
-        return None, None
-
-    xs, ys = [], []
-    for k in eps_keys:
-        s = sweep_summary[k]
-        baseline_usd = s.get("baseline_fuel_usd", 0.0)
-        fuel_usd = s.get("total_fuel_cost_usd", 0.0)
-        xs.append(float(k))
-        ys.append(baseline_usd - fuel_usd)
-
-    xs_arr = np.array(xs)
-    ys_arr = np.array(ys)
-
-    x_min, x_max = float(xs_arr[0]), float(xs_arr[-1])
-    y_min, y_max = float(ys_arr.min()), float(ys_arr.max())
-    if x_max == x_min or y_max == y_min:
-        return xs[0], xs[0]
-
-    xs_n = (xs_arr - x_min) / (x_max - x_min)
-    ys_n = (ys_arr - y_min) / (y_max - y_min)
-
-    interp = PchipInterpolator(xs_n, ys_n)
-    x_fine = np.linspace(xs_n[0], xs_n[-1], 10_000)
-
-    dy  = interp(x_fine, 1)
-    d2y = interp(x_fine, 2)
-    kappa = np.abs(d2y) / (1.0 + dy ** 2) ** 1.5
-
-    best_idx = int(np.argmax(kappa))
-    eps_star_n = float(x_fine[best_idx])
-    eps_star = round(eps_star_n * (x_max - x_min) + x_min, 6)
-    eps_applied = min(xs, key=lambda e: abs(e - eps_star))
-    return eps_star, eps_applied
-
-
-# ── Solvers (identical to v1.x) ───────────────────────────────────────────────
+# ── Solvers ──────────────────────────────────────────────────────────────────
 
 def pyomo_gurobi_highs_assignment(cost_matrix, forbidden_pairs=None):
     n_rows, n_cols = cost_matrix.shape
@@ -494,6 +378,160 @@ def gurobi_cm_fuel_constrained_assignment(fuel_matrix, cost_matrix, cost_budget,
     return np.array(row_ind)[order], np.array(col_ind)[order]
 
 
+# ── Global ε-constraint solver ───────────────────────────────────────────────
+
+LEX_FUEL_TOL_KG = 1e-6
+LEX_COST_TOL_USD = 1e-5
+
+
+def _solve_pyomo_model(model):
+    solver = SolverFactory("appsi_highs")
+    solver.options["output_flag"] = False
+    solver.options["mip_rel_gap"] = 0
+    solver.options["time_limit"] = 300
+    result = solver.solve(model)
+    if (result.solver.status != SolverStatus.ok or
+            result.solver.termination_condition != TerminationCondition.optimal):
+        raise RuntimeError(
+            f"Global epsilon solver failed: status={result.solver.status}, "
+            f"termination={result.solver.termination_condition}"
+        )
+
+
+def pyomo_global_fuel_constrained_assignment(group_problems, variable_cost_budget):
+    """Lexicographically minimise fuel, cost, then swaps under one daily budget."""
+    arcs = [
+        (g, i, j)
+        for g, problem in enumerate(group_problems)
+        for i in range(problem["n"])
+        for j in range(problem["n"])
+        if (i, j) not in problem["forbidden_pairs"]
+    ]
+
+    model = ConcreteModel()
+    model.arcs = Set(dimen=3, initialize=arcs)
+    model.x = Var(model.arcs, domain=Binary)
+    model.assignments = ConstraintList()
+    for g, problem in enumerate(group_problems):
+        n = problem["n"]
+        forbidden = problem["forbidden_pairs"]
+        for i in range(n):
+            model.assignments.add(
+                sum(model.x[g, i, j] for j in range(n) if (i, j) not in forbidden) == 1
+            )
+        for j in range(n):
+            model.assignments.add(
+                sum(model.x[g, i, j] for i in range(n) if (i, j) not in forbidden) == 1
+            )
+
+    fuel_expr = sum(
+        float(group_problems[g]["fuel_matrix_kg"][i, j]) * model.x[g, i, j]
+        for g, i, j in arcs
+    )
+    cost_expr = sum(
+        float(group_problems[g]["cost_matrix"][i, j]) * model.x[g, i, j]
+        for g, i, j in arcs
+    )
+    swap_expr = sum(model.x[g, i, j] for g, i, j in arcs if i != j)
+
+    model.budget = Constraint(expr=cost_expr <= variable_cost_budget + LEX_COST_TOL_USD)
+    model.objective = Objective(expr=fuel_expr, sense=minimize)
+    _solve_pyomo_model(model)
+    fuel_star = value(fuel_expr)
+
+    model.objective.deactivate()
+    model.fuel_tie = Constraint(expr=fuel_expr <= fuel_star + LEX_FUEL_TOL_KG)
+    model.cost_objective = Objective(expr=cost_expr, sense=minimize)
+    _solve_pyomo_model(model)
+    cost_star = value(cost_expr)
+
+    model.cost_objective.deactivate()
+    model.cost_tie = Constraint(expr=cost_expr <= cost_star + LEX_COST_TOL_USD)
+    model.swap_objective = Objective(expr=swap_expr, sense=minimize)
+    _solve_pyomo_model(model)
+
+    assignments = {}
+    for g, problem in enumerate(group_problems):
+        selected = np.empty(problem["n"], dtype=int)
+        for i in range(problem["n"]):
+            matches = [
+                j for j in range(problem["n"])
+                if (g, i, j) in model.x and value(model.x[g, i, j]) > 0.5
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(f"Global solver returned invalid assignment for group {g}, row {i}")
+            selected[i] = matches[0]
+        assignments[g] = selected
+    return assignments
+
+
+def gurobi_cm_global_fuel_constrained_assignment(group_problems, variable_cost_budget):
+    """Gurobi Cluster Manager equivalent of the global lexicographic solve."""
+    import gurobipy as gp
+    from gurobipy import GRB
+
+    env = _gurobi_cm_env()
+    with gp.Model(env=env) as model:
+        model.setParam("MIPGap", 0)
+        model.setParam("TimeLimit", 300)
+        arcs = [
+            (g, i, j)
+            for g, problem in enumerate(group_problems)
+            for i in range(problem["n"])
+            for j in range(problem["n"])
+            if (i, j) not in problem["forbidden_pairs"]
+        ]
+        x = model.addVars(arcs, vtype=GRB.BINARY, name="x")
+        for g, problem in enumerate(group_problems):
+            n = problem["n"]
+            forbidden = problem["forbidden_pairs"]
+            for i in range(n):
+                model.addConstr(gp.quicksum(x[g, i, j] for j in range(n) if (i, j) not in forbidden) == 1)
+            for j in range(n):
+                model.addConstr(gp.quicksum(x[g, i, j] for i in range(n) if (i, j) not in forbidden) == 1)
+
+        fuel_expr = gp.quicksum(
+            float(group_problems[g]["fuel_matrix_kg"][i, j]) * x[g, i, j]
+            for g, i, j in arcs
+        )
+        cost_expr = gp.quicksum(
+            float(group_problems[g]["cost_matrix"][i, j]) * x[g, i, j]
+            for g, i, j in arcs
+        )
+        swap_expr = gp.quicksum(x[g, i, j] for g, i, j in arcs if i != j)
+        model.addConstr(cost_expr <= variable_cost_budget + LEX_COST_TOL_USD)
+
+        model.setObjective(fuel_expr, GRB.MINIMIZE)
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Global Gurobi fuel solve failed: status={model.Status}")
+        fuel_star = fuel_expr.getValue()
+
+        model.addConstr(fuel_expr <= fuel_star + LEX_FUEL_TOL_KG)
+        model.setObjective(cost_expr, GRB.MINIMIZE)
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Global Gurobi cost tie-break failed: status={model.Status}")
+        cost_star = cost_expr.getValue()
+
+        model.addConstr(cost_expr <= cost_star + LEX_COST_TOL_USD)
+        model.setObjective(swap_expr, GRB.MINIMIZE)
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Global Gurobi swap tie-break failed: status={model.Status}")
+
+        assignments = {}
+        for g, problem in enumerate(group_problems):
+            selected = np.empty(problem["n"], dtype=int)
+            for i in range(problem["n"]):
+                matches = [j for j in range(problem["n"]) if (g, i, j) in x and x[g, i, j].X > 0.5]
+                if len(matches) != 1:
+                    raise RuntimeError(f"Global Gurobi returned invalid assignment for group {g}, row {i}")
+                selected[i] = matches[0]
+            assignments[g] = selected
+        return assignments
+
+
 # ── Feasibility check ────────────────────────────────────────────────────────
 
 def _check_feasibility(n, forbidden_pairs):
@@ -734,105 +772,131 @@ def optimize_group(group_df, group_index, forbidden_pairs=None):
     return results, float(current_cost), float(optimal_cost), float(savings), False
 
 
-def optimize_group_eps(group_df, group_index, forbidden_pairs, eps_values, c_star):
-    """ε-sweep for one group. Returns list of (eps, result_rows)."""
-    n = len(group_df)
-    if n == 0 or not eps_values:
-        return []
-
-    route_in_df = "Route" in group_df.columns
-
-    aircraft_perf_corr  = group_df["avg_perf_corr"].to_numpy()
-    aircraft_fh_rate    = group_df["total_fh_rate"].to_numpy()
+def _build_group_problem(group_df, group_index, forbidden_pairs):
+    aircraft_perf_corr = group_df["avg_perf_corr"].to_numpy()
+    aircraft_fh_rate = group_df["total_fh_rate"].to_numpy()
     aircraft_cycle_rate = group_df["total_cycle_rate"].to_numpy()
-    route_fuel    = group_df["total_baseline_fuel"].to_numpy()
-    route_hours   = group_df["total_pred_act_hours"].to_numpy()
+    route_fuel = group_df["total_baseline_fuel"].to_numpy()
+    route_hours = group_df["total_pred_act_hours"].to_numpy()
     route_sectors = group_df["total_sectors"].to_numpy()
+    fuel_matrix_kg = np.outer(aircraft_perf_corr, route_fuel)
+    cost_matrix = (
+        fuel_matrix_kg * FUEL_PRICE
+        + np.outer(aircraft_fh_rate, route_hours)
+        + np.outer(aircraft_cycle_rate, route_sectors)
+    )
+    return {
+        "group_df": group_df,
+        "group_index": group_index,
+        "n": len(group_df),
+        "forbidden_pairs": set(forbidden_pairs),
+        "fuel_matrix_kg": fuel_matrix_kg,
+        "cost_matrix": cost_matrix,
+    }
 
-    fuel_matrix  = np.outer(aircraft_perf_corr, route_fuel) * FUEL_PRICE
-    fh_matrix    = np.outer(aircraft_fh_rate, route_hours)
-    cycle_matrix = np.outer(aircraft_cycle_rate, route_sectors)
-    cost_matrix  = fuel_matrix + fh_matrix + cycle_matrix
 
-    aircraftreg_list    = group_df["aircraftreg"].to_list()
-    base_list           = group_df["base"].to_list()
-    perf_type_list      = group_df["perf_type"].to_list()
-    mtow_list           = group_df["mtow"].to_list()
-    avg_perf_corr_list  = group_df["avg_perf_corr"].to_list()
-    seat_config_list    = group_df["seat_config"].to_list()
-    total_trip_fuel_list  = group_df["total_trip_fuel"].to_list()
-    total_deg_burn_list   = group_df["total_deg_burn"].to_list()
-    flt_date_list       = group_df["flt_date"].to_list()
-    route_fuel_list     = route_fuel.tolist()
-    route_hours_list    = route_hours.tolist()
-    route_sectors_list  = route_sectors.tolist()
-    fh_rate_list        = aircraft_fh_rate.tolist()
-    cycle_rate_list     = aircraft_cycle_rate.tolist()
-    if route_in_df:
-        route_list       = group_df["Route"].to_list()
-        flt_numbers_list = group_df["flt_numbers"].to_list()
+def _rows_for_assignment(problem, selected_routes, epsilon):
+    """Convert an aircraft->route permutation into the established row schema."""
+    group_df = problem["group_df"]
+    n = problem["n"]
+    reverse_assignment = np.empty(n, dtype=int)
+    reverse_assignment[selected_routes] = np.arange(n)
 
-    eps_results = []
+    aircraftreg = group_df["aircraftreg"].to_list()
+    base = group_df["base"].to_list()
+    perf_type = group_df["perf_type"].to_list()
+    mtow = group_df["mtow"].to_list()
+    perf_corr = group_df["avg_perf_corr"].to_list()
+    seat_config = group_df["seat_config"].to_list()
+    trip_fuel = group_df["total_trip_fuel"].to_list()
+    deg_burn = group_df["total_deg_burn"].to_list()
+    flt_date = group_df["flt_date"].to_list()
+    route_fuel = group_df["total_baseline_fuel"].to_list()
+    route_hours = group_df["total_pred_act_hours"].to_list()
+    route_sectors = group_df["total_sectors"].to_list()
+    fh_rate = group_df["total_fh_rate"].to_list()
+    cycle_rate = group_df["total_cycle_rate"].to_list()
+    route_in_df = "Route" in group_df.columns
+    routes = group_df["Route"].to_list() if route_in_df else None
+    flight_numbers = group_df["flt_numbers"].to_list() if route_in_df else None
+    cost_matrix = problem["cost_matrix"]
 
-    for eps in eps_values:
-        budget = float(c_star) * (1.0 + eps)
+    rows = []
+    for route_idx in range(n):
+        aircraft_idx = int(reverse_assignment[route_idx])
+        opti_fuel_used = route_fuel[route_idx] * perf_corr[aircraft_idx]
+        row = {
+            "epsilon": epsilon,
+            "group_index": problem["group_index"],
+            "flt_date": flt_date[route_idx],
+            "aircraftreg": aircraftreg[route_idx],
+            "base": base[route_idx],
+            "perf_type": perf_type[route_idx],
+            "mtow": mtow[route_idx],
+            "avg_perf_corr": perf_corr[route_idx],
+            "seat_config": seat_config[route_idx],
+            "total_trip_fuel": trip_fuel[route_idx],
+            "total_deg_burn": deg_burn[route_idx],
+            "total_baseline_fuel": route_fuel[route_idx],
+            "total_pred_act_hours": route_hours[route_idx],
+            "total_sectors": route_sectors[route_idx],
+            "total_fh_rate": fh_rate[route_idx],
+            "total_cycle_rate": cycle_rate[route_idx],
+            "opti_aircraftreg": aircraftreg[aircraft_idx],
+            "opti_aircraftreg_avg_perf_corr": perf_corr[aircraft_idx],
+            "opti_seat_config": seat_config[aircraft_idx],
+            "opti_total_baseline_fuel": route_fuel[route_idx],
+            "opti_fh_rate": fh_rate[aircraft_idx],
+            "opti_cycle_rate": cycle_rate[aircraft_idx],
+            "opti_fuel_used": opti_fuel_used,
+            "fuel_delta": trip_fuel[route_idx] - opti_fuel_used,
+            "current_cost": float(cost_matrix[route_idx, route_idx]),
+            "opti_cost": float(cost_matrix[aircraft_idx, route_idx]),
+            "savings": float(cost_matrix[route_idx, route_idx] - cost_matrix[aircraft_idx, route_idx]),
+            "changed": route_idx != aircraft_idx,
+        }
+        if route_in_df:
+            row["Route"] = routes[route_idx]
+            row["flt_numbers"] = flight_numbers[route_idx]
+        rows.append(row)
+    return rows
+
+
+def optimize_global_eps(group_problems, fixed_rows, eps_values, total_cost_star):
+    """Solve every epsilon with one global daily cost budget."""
+    fixed_cost = sum(row["opti_cost"] for row in fixed_rows)
+    results = []
+    for eps in sorted(set(float(e) for e in eps_values)):
+        total_budget = float(total_cost_star) * (1.0 + eps)
+        variable_budget = total_budget - fixed_cost
         if SOLVER_BACKEND == "gurobi":
-            row_ind, col_ind = _gurobi_call_with_retry(
-                gurobi_cm_fuel_constrained_assignment,
-                fuel_matrix, cost_matrix, budget, forbidden_pairs
+            assignments = _gurobi_call_with_retry(
+                gurobi_cm_global_fuel_constrained_assignment,
+                group_problems,
+                variable_budget,
             )
         else:
-            row_ind, col_ind = pyomo_fuel_constrained_assignment(
-                fuel_matrix, cost_matrix, budget, forbidden_pairs
+            assignments = pyomo_global_fuel_constrained_assignment(
+                group_problems,
+                variable_budget,
             )
-        if row_ind is None:
-            continue
 
-        reverse_assignment = np.empty(n, dtype=int)
-        reverse_assignment[col_ind] = np.arange(n)
-
-        result_rows = []
-        for i in range(n):
-            opt_idx = reverse_assignment[i]
-            opti_fuel_used = route_fuel_list[i] * avg_perf_corr_list[opt_idx]
-            row = {
-                "epsilon":     eps,
-                "group_index": group_index,
-                "flt_date":    flt_date_list[i],
-                "aircraftreg": aircraftreg_list[i],
-                "base":        base_list[i],
-                "perf_type":   perf_type_list[i],
-                "mtow":        mtow_list[i],
-                "avg_perf_corr": avg_perf_corr_list[i],
-                "seat_config": seat_config_list[i],
-                "total_trip_fuel":        total_trip_fuel_list[i],
-                "total_deg_burn":         total_deg_burn_list[i],
-                "total_baseline_fuel":    route_fuel_list[i],
-                "total_pred_act_hours": route_hours_list[i],
-                "total_sectors":          route_sectors_list[i],
-                "total_fh_rate":   fh_rate_list[i],
-                "total_cycle_rate": cycle_rate_list[i],
-                "opti_aircraftreg":              aircraftreg_list[opt_idx],
-                "opti_aircraftreg_avg_perf_corr": avg_perf_corr_list[opt_idx],
-                "opti_seat_config":              seat_config_list[opt_idx],
-                "opti_total_baseline_fuel":      route_fuel_list[i],
-                "opti_fh_rate":   fh_rate_list[opt_idx],
-                "opti_cycle_rate": cycle_rate_list[opt_idx],
-                "opti_fuel_used": opti_fuel_used,
-                "fuel_delta":     total_trip_fuel_list[i] - opti_fuel_used,
-                "current_cost":   float(cost_matrix[i, i]),
-                "opti_cost":      float(cost_matrix[opt_idx, i]),
-                "savings":        float(cost_matrix[i, i] - cost_matrix[opt_idx, i]),
-                "changed":        i != opt_idx,
-            }
-            if route_in_df:
-                row["Route"]       = route_list[i]
-                row["flt_numbers"] = flt_numbers_list[i]
-            result_rows.append(row)
-
-        eps_results.append((eps, result_rows))
-
-    return eps_results
+        rows = []
+        for group_number, problem in enumerate(group_problems):
+            rows.extend(_rows_for_assignment(problem, assignments[group_number], eps))
+        rows.extend({**row, "epsilon": eps} for row in fixed_rows)
+        actual_cost = sum(row["opti_cost"] for row in rows)
+        if actual_cost > total_budget + 0.02:
+            raise RuntimeError(
+                f"epsilon={eps} violates global budget: ${actual_cost:.6f} > ${total_budget:.6f}"
+            )
+        results.append((eps, rows, total_budget))
+        print(
+            f"  global eps={eps:.6f}: cost=${actual_cost:,.2f} / "
+            f"budget=${total_budget:,.2f}",
+            flush=True,
+        )
+    return results
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -864,23 +928,20 @@ def main():
 
     all_results    = []
     all_eps_rows   = []
+    epsilon_budgets = {}
+    group_problems = []
+    fixed_rows = []
     skipped_groups = []
     total_current_cost  = 0.0
     total_optimal_cost  = 0.0
     total_savings       = 0.0
     groups_processed    = 0
     base_group_counters = {}
-
-    eps_group_summary = {
-        eps: {
-            "total_opti_cost":    0.0,
-            "total_fuel_cost_kg": 0.0,
-            "baseline_fuel_kg":   0.0,
-            "n_changed":          0,
-            "n_groups":           0,
-        }
-        for eps in EPS_VALUES
-    }
+    if any(float(eps) < 0 for eps in EPS_VALUES):
+        raise ValueError("EPS_VALUES must be non-negative")
+    # A true cost-optimal reference is required for budgets, deltas and
+    # dominance checks even if the user omitted 0 from the configured grid.
+    sweep_eps_values = sorted({0.0, *(float(eps) for eps in EPS_VALUES)}) if EPS_VALUES else []
 
     for group_key, group in partitions.items():
         base = group_key[1]
@@ -936,23 +997,15 @@ def main():
             groups_processed   += 1
 
             if was_skipped:
+                fixed_rows.extend(group_results)
                 skipped_groups.append({
                     "group_index": group_index,
                     "reason": "infeasible constraints — route has no eligible aircraft",
                 })
-            elif EPS_VALUES:
-                eps_sweep = optimize_group_eps(
-                    group, group_index, forbidden_pairs, EPS_VALUES, optimal_cost
+            elif sweep_eps_values:
+                group_problems.append(
+                    _build_group_problem(group, group_index, forbidden_pairs)
                 )
-                _group_s1_fuel = sum(r["total_trip_fuel"] for r in group_results)
-                for eps, result_rows in eps_sweep:
-                    all_eps_rows.extend(result_rows)
-                    s = eps_group_summary[eps]
-                    s["total_opti_cost"]    += sum(r["opti_cost"]      for r in result_rows)
-                    s["total_fuel_cost_kg"] += sum(r["opti_fuel_used"] for r in result_rows)
-                    s["baseline_fuel_kg"]   += _group_s1_fuel
-                    s["n_changed"]          += sum(1 for r in result_rows if r["changed"])
-                    s["n_groups"]           += 1
 
         if groups_processed % 10 == 0 and groups_processed:
             print(f"  Processed {groups_processed}/{len(partitions)} groups...")
@@ -966,6 +1019,27 @@ def main():
         names = [g["group_index"] for g in skipped_groups]
         print(f"WARNING: {len(skipped_groups)} group(s) skipped (infeasible): {names}")
 
+    if sweep_eps_values:
+        if group_problems:
+            print(
+                f"\nSolving global epsilon sweep across {len(group_problems)} variable "
+                f"groups ({len(fixed_rows)} fixed rows)..."
+            )
+            global_sweep = optimize_global_eps(
+                group_problems,
+                fixed_rows,
+                sweep_eps_values,
+                total_optimal_cost,
+            )
+        else:
+            global_sweep = [
+                (eps, [{**row, "epsilon": eps} for row in fixed_rows], total_optimal_cost * (1 + eps))
+                for eps in sweep_eps_values
+            ]
+        for eps, rows, total_budget in global_sweep:
+            all_eps_rows.extend(rows)
+            epsilon_budgets[eps] = total_budget
+
     results_df = pl.DataFrame(all_results)
 
     out_path = f"{INTERMEDIATE_DIRECTORY}/{OUTPUT_FILE}"
@@ -977,58 +1051,116 @@ def main():
         json.dump(skipped_groups, f, indent=2)
 
     # ── ε-sweep outputs ───────────────────────────────────────────────────────
-    if EPS_VALUES and all_eps_rows:
+    if sweep_eps_values and all_eps_rows:
         eps_df = pl.DataFrame(all_eps_rows)
         eps_csv_path = f"{INTERMEDIATE_DIRECTORY}/{DATE_PREFIX}_eps_sweep_results.csv"
         eps_df.write_csv(eps_csv_path)
         print(f"eps-sweep results : {eps_csv_path}")
 
+        rows_by_eps = {
+            eps: [row for row in all_eps_rows if abs(float(row["epsilon"]) - eps) < 1e-12]
+            for eps in sweep_eps_values
+        }
+        expected_groups = {row["group_index"] for row in all_results}
+        expected_row_count = len(all_results)
+        for eps, rows in rows_by_eps.items():
+            if len(rows) != expected_row_count or {row["group_index"] for row in rows} != expected_groups:
+                raise RuntimeError(
+                    f"Invalid epsilon sweep coverage at eps={eps}: expected "
+                    f"{expected_row_count} rows/{len(expected_groups)} groups, got "
+                    f"{len(rows)} rows/{len({row['group_index'] for row in rows})} groups"
+                )
+        exact_points = []
         sweep_summary = {}
-        for eps in EPS_VALUES:
-            s = eps_group_summary.get(eps, {})
-            _baseline_kg = s.get("baseline_fuel_kg", 0.0)
+        for eps, rows in rows_by_eps.items():
+            total_cost = sum(row["opti_cost"] for row in rows)
+            total_fuel = sum(row["opti_fuel_used"] for row in rows)
+            baseline_kg = sum(row["total_trip_fuel"] for row in rows)
+            exact_points.append((eps, total_cost, total_fuel))
             sweep_summary[str(eps)] = {
-                "total_opti_cost":     round(s.get("total_opti_cost", 0.0), 2),
-                "total_fuel_cost_kg":  round(s.get("total_fuel_cost_kg", 0.0), 2),
-                "total_fuel_cost_usd": round(s.get("total_fuel_cost_kg", 0.0) * FUEL_PRICE, 2),
-                "n_changed":           s.get("n_changed", 0),
-                "n_groups":            s.get("n_groups", 0),
-                "baseline_fuel_kg":    round(_baseline_kg, 2),
-                "baseline_fuel_usd":   round(_baseline_kg * FUEL_PRICE, 2),
+                "total_opti_cost": round(total_cost, 2),
+                "total_fuel_cost_kg": round(total_fuel, 2),
+                "total_fuel_cost_usd": round(total_fuel * FUEL_PRICE, 2),
+                "n_changed": sum(1 for row in rows if row["changed"]),
+                "n_groups": len({row["group_index"] for row in rows}),
+                "baseline_fuel_kg": round(baseline_kg, 2),
+                "baseline_fuel_usd": round(baseline_kg * FUEL_PRICE, 2),
+                "global_cost_budget": round(epsilon_budgets[eps], 2),
+                "budget_slack_usd": round(epsilon_budgets[eps] - total_cost, 2),
+                "epsilon_formulation": "global_daily_budget_v2",
+                "lexicographic_objectives": ["fuel_kg", "total_cost_usd", "changed_assignments"],
             }
+
+        # Nested global budgets imply non-increasing optimum fuel.  With the
+        # cost tie-break, realised cost is non-decreasing as well.  A violation
+        # means the solver result is not a trustworthy frontier sample.
+        for previous, current in zip(exact_points, exact_points[1:]):
+            if current[2] > previous[2] + 0.01:
+                raise RuntimeError(
+                    f"Invalid epsilon sweep: fuel increased from eps={previous[0]} to eps={current[0]}"
+                )
+            if current[1] < previous[1] - 0.01:
+                raise RuntimeError(
+                    f"Invalid epsilon sweep: realised cost decreased from eps={previous[0]} to eps={current[0]}"
+                )
+
+        # ── Select only from validated, actually solved objective points ─────
+        selection = select_frontier_point(
+            sweep_summary,
+            max_cost_per_fuel_kg=EPS_MAX_COST_PER_FUEL_KG,
+            min_prominence=EPS_KNEE_MIN_PROMINENCE,
+        )
+        applied_eps = None
+        if AUTO_SELECT_EPS:
+            if AUTO_SELECT_EPS_METHOD != "frontier":
+                print(
+                    f"WARNING: legacy AUTO_SELECT_EPS_METHOD={AUTO_SELECT_EPS_METHOD!r} "
+                    "is retired; using validated actual-cost frontier selection"
+                )
+            applied_eps = selection["selected_epsilon"]
+            if applied_eps is None:
+                print(
+                    "No defensible interior epsilon point found; keeping the cost-optimal assignment. "
+                    f"Reason: {selection['selection_reason']}"
+                )
+            else:
+                print(
+                    f"Validated frontier selected eps={applied_eps:.6f} "
+                    f"({applied_eps * 100:.4f}%): {selection['selection_reason']}"
+                )
+        elif SELECTED_EPS is not None:
+            matching = [eps for eps in rows_by_eps if abs(eps - float(SELECTED_EPS)) < 1e-12]
+            if not matching:
+                print(
+                    f"WARNING: SELECTED_EPS={SELECTED_EPS} is not in EPS_VALUES "
+                    "— keeping standard cost-optimal result"
+                )
+                selection["selected_epsilon"] = None
+                selection["selection_rule"] = "cost_optimal"
+                selection["selection_reason"] = "manual epsilon was not present in the solved grid"
+            else:
+                applied_eps = matching[0]
+                selection["selected_epsilon"] = applied_eps
+                selection["selection_rule"] = "manual"
+                point_status = selection["frontier_status"][applied_eps]
+                if point_status["is_dominated"] or point_status["is_duplicate"]:
+                    selection["selection_reason"] = (
+                        "manual epsilon override; warning: selected objective point is dominated or duplicate"
+                    )
+                    print(f"WARNING: manual eps={applied_eps} is dominated or duplicate")
+                else:
+                    selection["selection_reason"] = "manual epsilon override"
+        else:
+            selection["selected_epsilon"] = None
+            selection["selection_rule"] = "cost_optimal"
+            selection["selection_reason"] = "automatic selection disabled; no manual epsilon supplied"
+
+        annotate_summary(sweep_summary, selection)
 
         summary_path = f"{INTERMEDIATE_DIRECTORY}/{DATE_PREFIX}_eps_sweep_summary.json"
         with open(summary_path, "w") as f:
             json.dump(sweep_summary, f, indent=2)
         print(f"eps-sweep summary : {summary_path}")
-
-        # ── Auto-select ε* ────────────────────────────────────────────────────
-        eps_star = None
-        auto_selected_eps = None
-        applied_eps = None
-
-        if AUTO_SELECT_EPS:
-            _selectors = {
-                "chord":     _chord_select_eps,
-                "curvature": _curvature_select_eps,
-            }
-            _selector = _selectors.get(AUTO_SELECT_EPS_METHOD, _kneedle_select_eps)
-            eps_star, auto_selected_eps = _selector(sweep_summary)
-            if auto_selected_eps is not None:
-                applied_eps = auto_selected_eps
-                print(
-                    f"{AUTO_SELECT_EPS_METHOD} eps*={eps_star:.6f} ({eps_star * 100:.4f}%) "
-                    f"-> nearest grid eps={auto_selected_eps} applied"
-                )
-        elif SELECTED_EPS is not None:
-            if SELECTED_EPS not in EPS_VALUES:
-                print(
-                    f"WARNING: SELECTED_EPS={SELECTED_EPS} is not in EPS_VALUES "
-                    "— keeping standard cost-optimal result"
-                )
-            else:
-                applied_eps = SELECTED_EPS
-                auto_selected_eps = SELECTED_EPS
 
         if applied_eps is not None:
             chosen_rows = [
@@ -1040,14 +1172,10 @@ def main():
                 pl.DataFrame(chosen_rows).write_csv(out_path)
                 print(f"Applied eps={applied_eps}: {OUTPUT_FILE} now reflects eps solution")
 
-        for k in sweep_summary:
-            sweep_summary[k]["eps_star"]           = eps_star
-            sweep_summary[k]["kneedle_eps_star"]   = eps_star
-            sweep_summary[k]["auto_selected_eps"]  = auto_selected_eps
-            sweep_summary[k]["auto_select_method"] = AUTO_SELECT_EPS_METHOD if AUTO_SELECT_EPS else None
-        with open(summary_path, "w") as f:
-            json.dump(sweep_summary, f, indent=2)
-        print(f"eps-sweep summary updated: eps*={eps_star}, applied={auto_selected_eps}")
+        print(
+            f"eps-sweep selection updated: method={selection['selection_rule']}, "
+            f"applied={selection['selected_epsilon']}"
+        )
 
     print(f"\nColumns : {results_df.columns}")
     print("\nStage 5 Assignment Optimisation complete.")

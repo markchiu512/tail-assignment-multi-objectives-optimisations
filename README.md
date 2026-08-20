@@ -44,7 +44,9 @@ Here, $F(x)$ represents the fuel-performance outcome, $C(x)$ the economic outcom
 
 Varying $\varepsilon$ produces an efficient-frontier-style set of alternatives. This allows stakeholders to see the marginal cost/fuel trade-off explicitly, rather than receiving a black-box recommendation.
 
-The public material intentionally stops at this level. Objective construction, coefficients, constraint definitions, candidate generation and solver configuration are excluded.
+The sanitised implementation solves each ε as a **single global daily budget** across compatible assignment groups. It then breaks ties lexicographically—minimum fuel, then realised cost, then number of changed assignments. The frontier selector removes duplicate and dominated solved points and can select only an actual upper-concave-hull vertex; it never interpolates a recommendation between MIP solutions.
+
+The public material intentionally omits operator-specific objective construction, coefficients, constraints, candidate generation and solver configuration.
 
 ## Predictive layer
 

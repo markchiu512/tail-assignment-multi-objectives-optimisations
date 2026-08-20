@@ -172,12 +172,15 @@ def _write_summary(
         f.write(f"  Fuel Bias           : {FUEL_BIAS:.2f}x\n")
 
         if eps_applied is not None:
-            if AUTO_SELECT_EPS and eps_star is not None:
-                _labels = {"kneedle": "Kneedle", "chord": "Max-Chord", "curvature": "Max-k"}
-                label = _labels.get(auto_select_method or "kneedle",
-                                    (auto_select_method or "kneedle").title())
+            if AUTO_SELECT_EPS:
+                _labels = {
+                    "actual_cost_concave_hull": "validated actual-cost frontier",
+                    "marginal_cost_limit": "marginal-cost limit",
+                }
+                label = _labels.get(auto_select_method or "actual_cost_concave_hull",
+                                    (auto_select_method or "actual_cost_concave_hull").title())
                 f.write(f"  eps Applied         : {eps_applied*100:.2f}% "
-                        f"(nearest grid to {label} eps*={eps_star*100:.4f}%, auto)\n")
+                        f"(actual solved point; {label}, auto)\n")
             else:
                 f.write(f"  eps Applied         : {eps_applied*100:.2f}% (manual)\n")
         else:
@@ -281,7 +284,7 @@ def main():
     # ── Read eps metadata from Stage 5 ────────────────────────────────────────
     eps_applied = None
     eps_star = None
-    auto_select_method = "kneedle"
+    auto_select_method = "actual_cost_concave_hull"
     sweep_path = f"{INTERMEDIATE_DIRECTORY}/{EPS_SUMMARY_JSON}"
     if os.path.exists(sweep_path):
         try:
@@ -289,8 +292,10 @@ def main():
                 sweep_data = json.load(f)
             first = next(iter(sweep_data.values()), {})
             eps_applied        = first.get("auto_selected_eps")
-            eps_star           = first.get("eps_star") or first.get("kneedle_eps_star")
-            auto_select_method = first.get("auto_select_method", "kneedle")
+            eps_star = first.get("eps_star")
+            if eps_star is None:
+                eps_star = first.get("kneedle_eps_star")
+            auto_select_method = first.get("auto_select_method", "actual_cost_concave_hull")
         except Exception:
             pass
 

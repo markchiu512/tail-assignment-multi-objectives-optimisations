@@ -818,6 +818,7 @@ def save_config_to_file(
     selected_eps=_NO_CHANGE,
     auto_select_eps=_NO_CHANGE,
     auto_select_eps_method=_NO_CHANGE,
+    eps_max_cost_per_fuel_kg=_NO_CHANGE,
     auto_threshold=_NO_CHANGE,
     fuel_bias=_NO_CHANGE,
     ground_events_source=_NO_CHANGE,
@@ -952,6 +953,13 @@ def save_config_to_file(
                 f'AUTO_SELECT_EPS_METHOD = "{auto_select_eps_method}"',
                 content
             )
+        if eps_max_cost_per_fuel_kg is not _NO_CHANGE:
+            val_repr = "None" if eps_max_cost_per_fuel_kg is None else repr(float(eps_max_cost_per_fuel_kg))
+            content = re.sub(
+                r"EPS_MAX_COST_PER_FUEL_KG\s*=\s*(?:None|[\d.]+)",
+                f"EPS_MAX_COST_PER_FUEL_KG = {val_repr}",
+                content,
+            )
         if auto_threshold is not _NO_CHANGE:
             content = re.sub(
                 r"AUTO_THRESHOLD\s*=\s*(?:True|False)",
@@ -1011,8 +1019,8 @@ with st.sidebar:
 
     # Current configuration summary
     st.subheader("Current Config")
-    _eps_method_label = {"kneedle": "Kneedle", "chord": "Max-Chord", "curvature": "Max-κ"}.get(
-        getattr(config, 'AUTO_SELECT_EPS_METHOD', 'kneedle'), getattr(config, 'AUTO_SELECT_EPS_METHOD', 'Kneedle').title()
+    _eps_method_label = {"frontier": "Validated frontier"}.get(
+        getattr(config, 'AUTO_SELECT_EPS_METHOD', 'frontier'), getattr(config, 'AUTO_SELECT_EPS_METHOD', 'Frontier').title()
     )
     _eps_mode = f"auto ({_eps_method_label})" if getattr(config, 'AUTO_SELECT_EPS', False) else (
         f"ε={config.SELECTED_EPS}" if getattr(config, 'SELECTED_EPS', None) else "cost-optimal"
@@ -1126,8 +1134,8 @@ if page == "Dashboard":
                             _json_auto_eps if (_auto and _json_auto_eps is not None)
                             else (getattr(config, 'SELECTED_EPS', None) or 0.0)
                         )
-                        _stored_method = _first.get('auto_select_method', 'kneedle')
-                        _method_label = {"kneedle": "Kneedle", "chord": "Max-Chord", "curvature": "Max-κ"}.get(
+                        _stored_method = _first.get('auto_select_method', 'actual_cost_concave_hull')
+                        _method_label = {"actual_cost_concave_hull": "Validated frontier", "marginal_cost_limit": "Marginal-cost limit"}.get(
                             _stored_method, _stored_method.title()
                         )
                         _mode = f"auto · {_method_label}" if _auto else "manual"
@@ -1632,15 +1640,17 @@ elif page == "Results Data":
             with tab4:
                 st.subheader("Cost Trade-off Table")
                 st.markdown(
-                    "Each row shows the fuel-optimal assignment achievable when total cost is allowed to "
-                    "exceed the minimum by at most ε (%)."
+                    "Each row is a solved daily assignment: minimise fuel under one global total-cost "
+                    "budget C ≤ C*(1+ε), then break ties by lower realised cost and fewer swaps."
                 )
                 _sweep_summary_path = f"{config.VOLUME_INTERMEDIATE_BASE}/{selected_date}/{selected_date}_eps_sweep_summary.json"
                 if _vol_exists(_sweep_summary_path):
                     try:
                         _sweep_data = json.loads(_vol_read_bytes(_sweep_summary_path).decode('utf-8'))
                         if _sweep_data:
-                            _cost_at_eps0_tab = next(iter(_sweep_data.values()), {}).get('total_opti_cost', 0)
+                            _eps0_tab = min(_sweep_data.items(), key=lambda item: abs(float(item[0])))[1]
+                            _cost_at_eps0_tab = _eps0_tab.get('total_opti_cost', 0)
+                            _fuel_at_eps0_tab = _eps0_tab.get('total_fuel_cost_kg', 0)
                             _tbl = []
                             for _eps_str, _s in _sweep_data.items():
                                 _eps_val = float(_eps_str)
@@ -1654,32 +1664,40 @@ elif page == "Results Data":
                                     'Fuel Saving vs Baseline (kg)': f"{_fuel_saving:+,.0f}",
                                     'Fuel Saving ($)': f"${_fuel_saving_usd:,.0f}",
                                     'Swaps': _s['n_changed'],
+                                    'Extra Fuel Saved vs ε=0 (kg)': f"{(_fuel_at_eps0_tab - _s.get('total_fuel_cost_kg', 0)):+,.0f}",
+                                    'Pareto': bool(_s.get('is_pareto', True)),
+                                    'Concave Hull': bool(_s.get('is_concave_hull', False)),
                                 })
                             st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
 
                             # Show auto-selected ε info
                             _fv = next(iter(_sweep_data.values()), {})
-                            _kstar = _fv.get('eps_star') or _fv.get('kneedle_eps_star')
                             _kapplied = _fv.get('auto_selected_eps')
-                            _fv_method = _fv.get('auto_select_method', 'kneedle')
-                            _fv_method_label = {"kneedle": "Kneedle", "chord": "Max-Chord", "curvature": "Max-κ"}.get(
+                            _fv_method = _fv.get('auto_select_method', 'actual_cost_concave_hull')
+                            _fv_method_label = {"actual_cost_concave_hull": "Validated frontier", "marginal_cost_limit": "Marginal-cost limit"}.get(
                                 _fv_method, _fv_method.title()
                             )
-                            if _kstar is not None and _kapplied is not None:
+                            if _kapplied is not None:
                                 st.success(
-                                    f"{_fv_method_label} ε\\* = **{_kstar*100:.4f}%** "
-                                    f"→ nearest grid ε = **{_kapplied*100:.2f}%** applied as assignment"
+                                    f"{_fv_method_label}: solved ε = **{_kapplied*100:.2f}%** applied. "
+                                    f"{_fv.get('selection_reason', '')}"
+                                )
+                            elif _fv.get('selection_reason'):
+                                st.info(
+                                    "No defensible interior knee was selected; the cost-optimal assignment was retained. "
+                                    f"{_fv.get('selection_reason')}"
                                 )
                             elif _kapplied is not None:
                                 st.info(f"Applied ε = {_kapplied*100:.2f}% (manual override)")
 
-                            # Sweep chart: ε on x-axis, fuel saving on y-axis
-                            _baseline_kg_chart = next(iter(_sweep_data.values()), {}).get('baseline_fuel_kg', 0)
-                            _cost_at_0_chart = next(iter(_sweep_data.values()), {}).get('total_opti_cost', 0)
+                            # Selection geometry: realised dollars, not epsilon, on x-axis.
+                            _eps0_chart = min(_sweep_data.items(), key=lambda item: abs(float(item[0])))[1]
+                            _fuel_at_0_chart = _eps0_chart.get('total_fuel_cost_kg', 0)
+                            _cost_at_0_chart = _eps0_chart.get('total_opti_cost', 0)
                             _chart_df = pd.DataFrame({
                                 'ε (%)': [float(k)*100 for k in _sweep_data],
-                                'Fuel Saving vs Baseline (kg)': [
-                                    _baseline_kg_chart - v['total_fuel_cost_kg']
+                                'Extra Fuel Saved vs ε=0 (kg)': [
+                                    _fuel_at_0_chart - v['total_fuel_cost_kg']
                                     for v in _sweep_data.values()
                                 ],
                                 'Cost vs ε=0 ($)': [
@@ -1688,14 +1706,14 @@ elif page == "Results Data":
                                 ],
                             })
                             fig_sweep = px.line(
-                                _chart_df, x='ε (%)', y='Fuel Saving vs Baseline (kg)',
-                                title="Fuel Saving vs Cost Slack",
+                                _chart_df, x='Cost vs ε=0 ($)', y='Extra Fuel Saved vs ε=0 (kg)',
+                                title="Solved Global Cost/Fuel Points",
                                 labels={
-                                    'ε (%)': 'ε — cost slack (%)',
-                                    'Fuel Saving vs Baseline (kg)': 'Fuel Saving (kg)',
+                                    'Cost vs ε=0 ($)': 'Realised extra total cost ($)',
+                                    'Extra Fuel Saved vs ε=0 (kg)': 'Additional fuel saved (kg)',
                                 },
                                 markers=True,
-                                hover_data={'Cost vs ε=0 ($)': ':.0f'},
+                                hover_data={'ε (%)': ':.3f'},
                             )
                             fig_sweep.update_traces(textposition='top center')
                             st.plotly_chart(fig_sweep, width="stretch")
@@ -1912,8 +1930,9 @@ elif page == "Configuration":
 
         st.markdown("**Auto-select ε**")
         st.caption(
-            "Fits a smooth curve to the sweep results and auto-selects the elbow ε, "
-            "then applies the nearest grid point. Choose the selection method below."
+            "Validates globally solved cost/fuel points, removes duplicates and dominated "
+            "solutions, and selects an actual upper-concave-hull vertex. If no prominent "
+            "knee exists, the cost-optimal assignment is retained."
         )
         new_auto_select_eps = st.toggle(
             "AUTO_SELECT_EPS",
@@ -1922,11 +1941,9 @@ elif page == "Configuration":
         )
         if new_auto_select_eps:
             _method_opts = {
-                "kneedle":   "Kneedle — max(y_norm − x_norm) on normalised diagonal",
-                "chord":     "Max-Chord — max perpendicular distance from endpoint chord",
-                "curvature": "Max-κ — sharpest bend (|y''| / (1 + y'²)^1.5)",
+                "frontier": "Validated frontier — actual cost/fuel concave hull",
             }
-            _current_method = getattr(config, 'AUTO_SELECT_EPS_METHOD', 'kneedle')
+            _current_method = getattr(config, 'AUTO_SELECT_EPS_METHOD', 'frontier')
             try:
                 _method_idx = list(_method_opts.keys()).index(_current_method)
             except ValueError:
@@ -1938,28 +1955,49 @@ elif page == "Configuration":
                 index=_method_idx,
                 key="auto_select_eps_method",
             )
-            # Show precise ε* from the last run if available
-            _sweep_path = f"{config.VOLUME_OUTPUT_DIRECTORY}/{config.DATE_PREFIX}_eps_sweep_summary.json"
+            _current_wtp = getattr(config, 'EPS_MAX_COST_PER_FUEL_KG', None)
+            _use_wtp = st.toggle(
+                "Use an explicit maximum extra cost per kg saved",
+                value=_current_wtp is not None,
+                key="eps_use_wtp",
+                help=(
+                    "Selects the last concave-frontier segment whose incremental extra total cost "
+                    "per additional kg of fuel saved is within this limit."
+                ),
+            )
+            if _use_wtp:
+                new_eps_max_cost_per_fuel_kg = st.number_input(
+                    "Maximum incremental cost ($/kg)",
+                    min_value=0.0,
+                    value=float(_current_wtp if _current_wtp is not None else 10.0),
+                    step=0.5,
+                    key="eps_max_cost_per_fuel_kg",
+                )
+            else:
+                new_eps_max_cost_per_fuel_kg = None
+            # Show the actual solved point from the last run if available.
+            _sweep_path = f"{config.VOLUME_INTERMEDIATE_DIRECTORY}/{config.DATE_PREFIX}_eps_sweep_summary.json"
             if _vol_exists(_sweep_path):
                 try:
                     _sd = json.loads(_vol_read_bytes(_sweep_path).decode('utf-8'))
                     _fv = next(iter(_sd.values()), {})
-                    _star = _fv.get('eps_star') or _fv.get('kneedle_eps_star')
                     _applied = _fv.get('auto_selected_eps')
-                    _run_method = _fv.get('auto_select_method', 'kneedle')
-                    _run_label = {"kneedle": "Kneedle", "chord": "Max-Chord", "curvature": "Max-κ"}.get(
+                    _run_method = _fv.get('auto_select_method', 'actual_cost_concave_hull')
+                    _run_label = {"actual_cost_concave_hull": "Validated frontier", "marginal_cost_limit": "Marginal-cost limit"}.get(
                         _run_method, _run_method.title()
                     )
-                    if _star is not None:
+                    if _applied is not None:
                         st.info(
-                            f"Last run ({_run_label}): ε\\* = **{_star*100:.4f}%** "
-                            f"→ nearest grid ε = **{_applied*100:.2f}%** applied"
+                            f"Last run ({_run_label}): solved ε = **{_applied*100:.2f}%** applied"
                         )
+                    else:
+                        st.info(f"Last run: no defensible knee; cost-optimal assignment retained. {_fv.get('selection_reason', '')}")
                 except Exception:
                     pass
             new_selected_eps = _NO_CHANGE  # auto mode — don't overwrite SELECTED_EPS
         else:
-            new_auto_select_eps_method = getattr(config, 'AUTO_SELECT_EPS_METHOD', 'kneedle')
+            new_auto_select_eps_method = getattr(config, 'AUTO_SELECT_EPS_METHOD', 'frontier')
+            new_eps_max_cost_per_fuel_kg = getattr(config, 'EPS_MAX_COST_PER_FUEL_KG', None)
             st.caption("Manual ε — choose from the EPS_VALUES preset list:")
             _eps_opts = [None] + list(new_eps_values)
 
@@ -2139,7 +2177,8 @@ elif page == "Configuration":
         new_autoland_aircraft != config.AUTOLAND_AIRCRAFTREG or
         new_eps_values != config.EPS_VALUES or
         new_auto_select_eps != getattr(config, 'AUTO_SELECT_EPS', True) or
-        new_auto_select_eps_method != getattr(config, 'AUTO_SELECT_EPS_METHOD', 'kneedle') or
+        new_auto_select_eps_method != getattr(config, 'AUTO_SELECT_EPS_METHOD', 'frontier') or
+        new_eps_max_cost_per_fuel_kg != getattr(config, 'EPS_MAX_COST_PER_FUEL_KG', None) or
         (not new_auto_select_eps and new_selected_eps is not _NO_CHANGE and new_selected_eps != config.SELECTED_EPS) or
         new_auto_threshold != getattr(config, 'AUTO_THRESHOLD', True) or
         new_fuel_bias != float(getattr(config, 'FUEL_BIAS', 1.5)) or
@@ -2174,6 +2213,7 @@ elif page == "Configuration":
                 selected_eps=new_selected_eps,
                 auto_select_eps=new_auto_select_eps,
                 auto_select_eps_method=new_auto_select_eps_method,
+                eps_max_cost_per_fuel_kg=new_eps_max_cost_per_fuel_kg,
                 auto_threshold=new_auto_threshold,
                 fuel_bias=new_fuel_bias,
                 ground_events_source="databricks" if new_ground_events_source else "xls",

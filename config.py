@@ -63,10 +63,18 @@ else:
     ML_MODELS_DIRECTORY = ML_MODELS_STAGING_DIRECTORY
 
 FUEL_PRICE = float(os.environ.get("FUEL_PRICE", "1.20"))
-EPS_VALUES = [round(i * 0.001, 3) for i in range(21)]
+# A denser public example grid near the cost optimum, then 0.1 percentage-point
+# increments to 2%.  Epsilon is a budget relaxation, not realised cost.
+EPS_VALUES = [round(i * 0.0005, 4) for i in range(21)] + [
+    round(i * 0.001, 3) for i in range(11, 21)
+]
 SELECTED_EPS = None
 AUTO_SELECT_EPS = True
-AUTO_SELECT_EPS_METHOD = "kneedle"
+# The selector operates on solved cost/fuel points, removes dominated outcomes,
+# and returns an actual upper-concave-hull vertex only when a knee is defensible.
+AUTO_SELECT_EPS_METHOD = "frontier"
+EPS_MAX_COST_PER_FUEL_KG = None
+EPS_KNEE_MIN_PROMINENCE = 0.03
 AUTO_THRESHOLD = True
 MIN_SAVINGS_THRESHOLD = 300.0
 FILTER_BY_TOP_GROUPS_INDEX = 9999
